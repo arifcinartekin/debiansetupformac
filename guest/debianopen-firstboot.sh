@@ -373,7 +373,11 @@ configure_ly() {
   # Mac terminal's, and ly aborts on a 0x0 screen. The size only sticks while
   # the console is open, so a wrapper sets 80x24 on its own stdin (the console)
   # and then becomes ly; debianopen-winsize corrects it within two seconds.
-  # Restart: should ly ever exit, the console must not stay empty
+  # Restart: should ly ever exit, the console must not stay empty.
+  # TERM: systemd gives a service on a serial line TERM=vt220 (no colours),
+  # and ly hands its own environment to the session. The Mac terminal behind
+  # the console handles xterm-256color (Arch sets it with systemd.tty.term,
+  # which Debian 12's systemd 252 does not have yet)
   cat > "$LY_WRAPPER" <<'WRAPPER_EOF'
 #!/bin/sh
 # Starts ly on the serial console with a usable size (debianopen)
@@ -388,6 +392,7 @@ WRAPPER_EOF
 [Service]
 ExecStart=
 ExecStart=$LY_WRAPPER
+Environment=TERM=xterm-256color
 Restart=always
 RestartSec=1
 DROPIN_EOF
@@ -399,6 +404,10 @@ DROPIN_EOF
 # Shell session for ly on the serial console (debianopen). ly sends a session's
 # output to a log file, which suits graphical sessions; a shell needs the terminal.
 exec >/dev/tty 2>&1
+# The serial console reports vt220; the Mac terminal behind it handles more
+case "${TERM:-}" in
+  ""|dumb|vt100|vt220|linux) export TERM=xterm-256color ;;
+esac
 printf '\033[H\033[2J'
 exec "${SHELL:-/bin/bash}" -l
 SESSION_EOF
