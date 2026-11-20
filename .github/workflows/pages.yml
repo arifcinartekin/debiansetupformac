@@ -1,0 +1,50 @@
+# Publishes the install entry points on https://debian.arifcinartekin.me
+#
+#   /install     debianopen-setup.sh
+#   /uninstall   mac/debianuninstall.sh
+#   /            site/index.html
+#
+# The setup still fetches its companion files from raw.githubusercontent.com
+# (DEBIANOPEN_REPO / DEBIANOPEN_REF), so this site only has to serve the entry points.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - debianopen-setup.sh
+      - mac/debianuninstall.sh
+      - site/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the site
+        run: |
+          mkdir -p _site
+          cp site/index.html _site/index.html
+          cp site/debian-logo.svg _site/debian-logo.svg
+          cp debianopen-setup.sh _site/install
+          cp mac/debianuninstall.sh _site/uninstall
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
