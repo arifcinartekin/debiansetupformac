@@ -42,6 +42,8 @@
 #   DEBIANOPEN_ALPINE_MIRROR_URL=...   Where the Alpine ISO is fetched from first (default: this repo's GitHub release)
 #   DEBIANOPEN_DEBIAN_MIRROR_URL=...   Where the Debian ISO is fetched from first (default: this repo's GitHub release)
 #   DEBIANOPEN_APT_MIRROR=http://deb.debian.org   Debian package mirror used inside the VM
+#   DEBIANOPEN_BRIDGE=0           No bridged network (NAT only; default: bridged through socket_vmnet)
+#   DEBIANOPEN_BRIDGE_IF=en0      Mac interface to bridge (default: the one with the default route)
 #
 # For testing (non-macOS / no HVF): DEBIANOPEN_ALLOW_NON_MAC=1 DEBIANOPEN_ACCEL=tcg
 #   DEBIANOPEN_CPU=cortex-a72 DEBIANOPEN_FW_CODE=... DEBIANOPEN_FW_VARS=...
@@ -101,6 +103,12 @@ ESP_SIZE="${DEBIANOPEN_ESP_SIZE:-1G}"
 DEB_USER="${DEBIANOPEN_USER:-user}"
 # 2222 is Arch Setup for Mac's, 2223 FreeBSD's: all three VMs can run at the same time
 SSH_PORT="${DEBIANOPEN_SSH_PORT:-2224}"
+# Bridged network: the VM gets its own address from your router, through
+# socket_vmnet (a small root service; QEMU itself stays unprivileged). The
+# same service serves Arch Setup for Mac and BSD Setup for Mac too
+BRIDGE="${DEBIANOPEN_BRIDGE:-1}"
+BRIDGE_IF="${DEBIANOPEN_BRIDGE_IF:-}"
+VMNET_DIR="/opt/socket_vmnet"
 ACCEL="${DEBIANOPEN_ACCEL:-hvf}"
 CPU_MODEL="${DEBIANOPEN_CPU:-host}"
 
@@ -122,6 +130,8 @@ FW_CODE=""
 FW_VARS=""
 QEMU_BIN=""
 DEBIAN_ISO_SIZE=""
+MAC_LAN=""
+MAC_LOCAL=""
 HAS_TERMINFO=0
 LUKS_PW=""
 BREW_INSTALLED_BY_US=0
@@ -332,7 +342,7 @@ confirm_plan() {
   Integrity seal    : VM files checked before every boot, seal in the macOS Keychain
   Hostname          : ${DEB_HOSTNAME}
   Account           : ${DEB_USER} (sudo, no password on the serial console); root locked
-  Mac ports         : SSH 127.0.0.1:${SSH_PORT}
+  Network           : $([ "$BRIDGE" = 1 ] && echo "bridged (address from your router, socket_vmnet: asks for your Mac password once) + " || true)SSH on 127.0.0.1:${SSH_PORT}
   Alpine            : ${ALPINE_VERSION} (verified with sha256 + GPG)
   Debian            : ${DEBIAN_VERSION} (${DEBIAN_SUITE}), ${DEBIAN_ISO} (verified with pinned sha256 + GPG)
   Will change       : brew packages (qemu, gnupg),
@@ -406,6 +416,103 @@ prepare_dirs() {
   chmod 600 "$LOG_FILE"
   WORK="$(mktemp -d "${TMPDIR:-/tmp}/debianopen.XXXXXX")"
   chmod 700 "$WORK"
+  # Fixed per install, so the router hands the VM the same address every boot
+  MAC_LAN="$(random_mac)"
+  MAC_LOCAL="$(random_mac)"
+  printf '%s %s' "$MAC_LAN" "$MAC_LOCAL" | grep -Eq '^52:54:00(:[0-9a-f]{2}){3} 52:54:00(:[0-9a-f]{2}){3}$' \
+    || die "Could not generate MAC addresses ($MAC_LAN, $MAC_LOCAL)"
+}
+
+random_mac() { # 52:54:00:xx:xx:xx (QEMU's locally administered prefix)
+  # od may spread its output over several lines: join it before splitting
+  printf '52:54:00%s\n' "$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n' | sed 's/../:&/g')"
+}
+
+###############################################################################
+# BRIDGED NETWORK (socket_vmnet)
+###############################################################################
+# vmnet's bridged mode needs root, and Homebrew's QEMU does not carry Apple's
+# entitlement for it. socket_vmnet (from the Lima project) runs as a root
+# launchd service and hands an unprivileged QEMU a bridged network card.
+# Installed the way Lima recommends: binaries copied to /opt/socket_vmnet,
+# owned by root, so the service never runs a file your user could replace.
+# The service and its socket are shared by Arch, BSD and Debian Setup for Mac.
+vmnet_socket() { printf '/private/var/run/socket_vmnet.bridged.%s' "$1"; }
+vmnet_label() { printf 'io.github.lima-vm.socket_vmnet.bridged.%s' "$1"; }
+
+setup_bridge() {
+  if [ "$BRIDGE" != 1 ] || [ "$IS_MAC" != 1 ]; then
+    BRIDGE_IF=""
+    return 0
+  fi
+  [ -n "$BRIDGE_IF" ] || BRIDGE_IF="$(route -n get default 2>/dev/null | awk '$1 == "interface:" { print $2; exit }')"
+  if ! printf '%s' "$BRIDGE_IF" | grep -Eq '^[a-z]+[0-9]+$'; then
+    warn "No network interface to bridge (DEBIANOPEN_BRIDGE_IF=en0 picks one); NAT only"
+    BRIDGE_IF=""
+    return 0
+  fi
+  local sock label plist src
+  sock="$(vmnet_socket "$BRIDGE_IF")"
+  label="$(vmnet_label "$BRIDGE_IF")"
+  plist="/Library/LaunchDaemons/$label.plist"
+  if [ -S "$sock" ] && [ -x "$VMNET_DIR/bin/socket_vmnet_client" ]; then
+    ok "Bridged network on $BRIDGE_IF: socket_vmnet is already running"
+    return 0
+  fi
+
+  log "Bridged network on $BRIDGE_IF (socket_vmnet)"
+  if ! brew list --versions socket_vmnet >/dev/null 2>&1; then
+    brew install socket_vmnet || { warn "brew install socket_vmnet failed; NAT only"; BRIDGE_IF=""; return 0; }
+    FORMULAE_INSTALLED_BY_US="${FORMULAE_INSTALLED_BY_US:+$FORMULAE_INSTALLED_BY_US }socket_vmnet"
+  fi
+  src="$(brew --prefix socket_vmnet)/bin"
+  [ -x "$src/socket_vmnet" ] && [ -x "$src/socket_vmnet_client" ] || { warn "socket_vmnet binaries not found in $src; NAT only"; BRIDGE_IF=""; return 0; }
+  cat > "$WORK/vmnet.plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>Program</key><string>$VMNET_DIR/bin/socket_vmnet</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$VMNET_DIR/bin/socket_vmnet</string>
+    <string>--vmnet-mode=bridged</string>
+    <string>--vmnet-interface=$BRIDGE_IF</string>
+    <string>$sock</string>
+  </array>
+  <key>StandardErrorPath</key><string>/var/log/socket_vmnet.bridged.$BRIDGE_IF.log</string>
+  <key>RunAtLoad</key><true/>
+  <key>UserName</key><string>root</string>
+</dict>
+</plist>
+PLIST_EOF
+  if ! sudo -n true 2>/dev/null; then
+    if [ ! -r /dev/tty ]; then
+      warn "No terminal to ask for your Mac password; NAT only (run the setup from a terminal for the bridged network)"
+      BRIDGE_IF=""
+      return 0
+    fi
+    echo "    socket_vmnet runs as root: sudo asks for your Mac password once."
+  fi
+  if ! sudo /bin/sh -c '
+        set -e
+        install -d -o root -g wheel -m 755 "$1/bin"
+        install -o root -g wheel -m 755 "$2/socket_vmnet" "$2/socket_vmnet_client" "$1/bin/"
+        install -o root -g wheel -m 644 "$3" "$4"
+        launchctl bootout "system/$5" 2>/dev/null || true
+        launchctl bootstrap system "$4"' sh "$VMNET_DIR" "$src" "$WORK/vmnet.plist" "$plist" "$label" </dev/tty; then
+    warn "Could not install the socket_vmnet service; NAT only"
+    BRIDGE_IF=""
+    return 0
+  fi
+  local i=0
+  while [ ! -S "$sock" ] && [ "$i" -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
+  if [ -S "$sock" ]; then
+    ok "socket_vmnet bridges $BRIDGE_IF ($plist)"
+  else
+    warn "socket_vmnet did not start (log: /var/log/socket_vmnet.bridged.$BRIDGE_IF.log); the VM falls back to NAT until it runs"
+  fi
 }
 
 # Records what this script installed on the Mac so debianuninstall can offer to remove it.
@@ -429,6 +536,7 @@ write_manifest() {
     echo "installed_formulae=$formulae"
     echo "pinned_formulae=$([ "${DEBIANOPEN_PIN_BREW:-0}" = 1 ] && echo "qemu gnupg")"
     echo "ssh_port=$SSH_PORT"
+    echo "bridge_if=$BRIDGE_IF"
   } > "$MANIFEST"
 }
 
@@ -603,7 +711,7 @@ trap 'rc=$?; [ "$rc" -eq 0 ] || echo "DEBIANOPEN_ERROR: guest script exited with
 
 : "${ROOT_UUID:?}" "${LUKS_UUID:?}" "${ESP_ID:?}" "${ESP_UUID:?}" "${FILES_URL:?}" "${ALPINE_SERIES:?}"
 : "${ISO_SHA256:?}" "${ISO_SIZE:?}" "${DEBIAN_SUITE:?}" "${APT_MIRROR:?}"
-: "${DEB_HOSTNAME:?}" "${DEB_USER:?}" "${USER_PW:?}" "${SSH_PORT:?}" "${DEBIANOPEN_REPO:?}"
+: "${DEB_HOSTNAME:?}" "${DEB_USER:?}" "${USER_PW:?}" "${SSH_PORT:?}" "${DEBIANOPEN_REPO:?}" "${MAC_LAN:?}" "${MAC_LOCAL:?}"
 HAS_TERMINFO="${HAS_TERMINFO:-0}"
 ESP_OPTS="rw,relatime,fmask=0077,dmask=0077,errors=remount-ro"
 BTRFS_OPTS="rw,noatime,compress=zstd:1"
@@ -875,8 +983,30 @@ DEBIANOPEN_REPO=$DEBIANOPEN_REPO
 CONF_EOF
 chmod 644 /etc/debianopen.conf
 
-step "Network (systemd-networkd, DHCP), locale, console"
+step "Network (systemd-networkd: bridged + local SSH), locale, console"
+# Two network cards, told apart by the MAC addresses the launcher gives them:
+# the bridged one (or QEMU's NAT when the bridge is not running) gets its
+# address by DHCP; the second carries only the Mac's 127.0.0.1 SSH forward,
+# with a fixed address and no default route
 mkdir -p /etc/systemd/network
+cat > /etc/systemd/network/10-debianopen-lan.network <<NET_EOF
+# debianopen: bridged to the Mac's network, address from your router
+[Match]
+MACAddress=$MAC_LAN
+
+[Network]
+DHCP=yes
+NET_EOF
+cat > /etc/systemd/network/10-debianopen-local.network <<NET_EOF
+# debianopen: QEMU's NAT, only for ssh -p $SSH_PORT localhost on the Mac
+[Match]
+MACAddress=$MAC_LOCAL
+
+[Network]
+Address=10.0.2.15/24
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+NET_EOF
 cat > /etc/systemd/network/20-wired.network <<NET_EOF
 [Match]
 Name=en* eth*
@@ -907,6 +1037,7 @@ chroot /mnt /usr/bin/env -i HOME=/root TERM=dumb LANG=C.UTF-8 \
   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   ROOT_UUID="$ROOT_UUID" LUKS_UUID="$LUKS_UUID" DEB_USER="$DEB_USER" \
   SSH_PORT="$SSH_PORT" DEBIAN_SUITE="$DEBIAN_SUITE" APT_MIRROR="$APT_MIRROR" DEBIANOPEN_REPO="$DEBIANOPEN_REPO" \
+  MAC_LAN="$MAC_LAN" MAC_LOCAL="$MAC_LOCAL" \
   /bin/bash /root/debianopen-chroot.sh || die "installation inside the chroot failed"
 rm -f /mnt/root/debianopen-chroot.sh /mnt/root/.debianopen-pw /mnt/root/.debianopen-terminfo
 # The link systemd-resolved expects (the chroot used a copy of Alpine's file)
@@ -1005,7 +1136,7 @@ append vars " ISO_SHA256=$env(DEBIANOPEN_ISO_SHA256) ISO_SIZE=$env(DEBIANOPEN_IS
 append vars " DEBIAN_SUITE=$env(DEBIANOPEN_SUITE) APT_MIRROR=$env(DEBIANOPEN_APT_MIRROR)"
 append vars " DEB_HOSTNAME=$env(DEBIANOPEN_HOSTNAME) HAS_TERMINFO=$env(DEBIANOPEN_HAS_TERMINFO)"
 append vars " DEB_USER=$env(DEBIANOPEN_USER) USER_PW=$env(DEBIANOPEN_USER_PW) SSH_PORT=$env(DEBIANOPEN_SSH_PORT)"
-append vars " DEBIANOPEN_REPO=$env(DEBIANOPEN_REPO)"
+append vars " DEBIANOPEN_REPO=$env(DEBIANOPEN_REPO) MAC_LAN=$env(DEBIANOPEN_MAC_LAN) MAC_LOCAL=$env(DEBIANOPEN_MAC_LOCAL)"
 set timeout $env(DEBIANOPEN_IDLE_TIMEOUT)
 send -- "$vars sh /tmp/guest.sh; echo DEBIANOPEN_GUEST_DONE=\$?\r"
 
@@ -1103,6 +1234,8 @@ s.close()')"
   DEBIANOPEN_USER_PW="$TEMP_USER_PASSWORD" \
   DEBIANOPEN_SSH_PORT="$SSH_PORT" \
   DEBIANOPEN_REPO="$DEBIANOPEN_REPO" \
+  DEBIANOPEN_MAC_LAN="$MAC_LAN" \
+  DEBIANOPEN_MAC_LOCAL="$MAC_LOCAL" \
   DEBIANOPEN_BOOT_NUDGES="${DEBIANOPEN_BOOT_NUDGES:-40}" \
   DEBIANOPEN_IDLE_TIMEOUT="${DEBIANOPEN_IDLE_TIMEOUT:-1800}" \
     expect -f "$WORK/installer.exp" || die "The installer VM failed. Log: $LOG_FILE"
@@ -1135,6 +1268,8 @@ write_start_script() {
     printf 'QEMU_BIN=%q\n' "$QEMU_BIN"
     printf 'QEMU_MACHINE=(-machine virt,highmem=on -accel %q -cpu %q -smp %q -m %q)\n' "$ACCEL" "$CPU_MODEL" "$CPUS" "$MEM"
     printf 'QEMU_MONITOR=(%s)\n' "$mon_opt"
+    printf 'BRIDGE_IF=%q\n' "$BRIDGE_IF"
+    printf 'MAC_LAN=%q\nMAC_LOCAL=%q\n' "$MAC_LAN" "$MAC_LOCAL"
     cat <<'LAUNCHER_EOF'
 DIR="$(cd "$(dirname "$0")" && pwd)" || exit 1
 pid="$(cat "$DIR/qemu.pid" 2>/dev/null || true)"
@@ -1158,22 +1293,35 @@ if [ "$WINSIZE" = 1 ]; then
     -chardev "pipe,id=winsize,path=$DIR/winsize"
     -device virtserialport,bus=vser0.0,chardev=winsize,name=org.debianopen.winsize)
 fi
-# SSH port on the Mac, 127.0.0.1 only
-NETDEV="user,id=n0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22"
+# Network: with socket_vmnet running, the first card is bridged (address from
+# your router) and the second is QEMU's NAT, only for SSH on 127.0.0.1. Without
+# it, the first card is the NAT. The guest tells them apart by MAC address
+NAT="user,id=nat,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22"
+VMNET_CLIENT=/opt/socket_vmnet/bin/socket_vmnet_client
+VMNET_SOCK="/private/var/run/socket_vmnet.bridged.$BRIDGE_IF"
+RUN=()
+if [ -n "$BRIDGE_IF" ] && [ -S "$VMNET_SOCK" ] && [ -x "$VMNET_CLIENT" ]; then
+  RUN=("$VMNET_CLIENT" "$VMNET_SOCK")
+  NET_ARGS=(-device "virtio-net-pci,netdev=lan,mac=$MAC_LAN" -netdev socket,id=lan,fd=3
+            -device "virtio-net-pci,netdev=nat,mac=$MAC_LOCAL" -netdev "$NAT")
+  echo "Network: bridged on $BRIDGE_IF (address from your router); SSH also on 127.0.0.1:$SSH_PORT"
+else
+  NET_ARGS=(-device "virtio-net-pci,netdev=nat,mac=$MAC_LAN" -netdev "$NAT")
+  [ -z "$BRIDGE_IF" ] || echo "Network: socket_vmnet is not running on $BRIDGE_IF, NAT only this time (sudo launchctl kickstart system/io.github.lima-vm.socket_vmnet.bridged.$BRIDGE_IF)" >&2
+fi
 # Closing the terminal must not skip the reseal below; QEMU still gets the signal
 hup=""
 trap 'hup=1' HUP TERM
 # In the background so this script can forward window size changes, with the
 # terminal as its input (a background job would otherwise read /dev/null)
-"$QEMU_BIN" "${QEMU_MACHINE[@]}" \
+${RUN[@]+"${RUN[@]}"} "$QEMU_BIN" "${QEMU_MACHINE[@]}" \
   -drive if=pflash,format=raw,readonly=on,file="$DIR/efi-code.fd" \
   -drive if=pflash,format=raw,file="$DIR/vars.run.fd" \
   -drive if=none,id=root,file="$DIR/disk.qcow2",format=qcow2 \
   -device virtio-blk-pci,drive=root \
   -drive if=none,id=esp,file="$DIR/efi.qcow2",format=qcow2 \
   -device virtio-blk-pci,drive=esp,bootindex=0 \
-  -device virtio-net-pci,netdev=n0 \
-  -netdev "$NETDEV" \
+  "${NET_ARGS[@]}" \
   ${WINSIZE_ARGS[@]+"${WINSIZE_ARGS[@]}"} \
   -qmp "unix:$DIR/qmp.sock,server=on,wait=off" \
   -pidfile "$DIR/qemu.pid" \
@@ -1472,6 +1620,7 @@ main() {
   confirm_plan
   ask_passphrase
   prepare_dirs
+  setup_bridge
   write_manifest
   fetch_companions
   get_alpine
@@ -1500,7 +1649,7 @@ main() {
                     terminal running debianopen) and asks for it everywhere else.
                     The first-boot wizard then offers zsh, htop, fastfetch, lsd
                     and the ly login screen.
-  SSH             : ssh -p $SSH_PORT ${DEB_USER}@localhost   (reachable from this Mac only)
+  SSH             : ssh -p $SSH_PORT ${DEB_USER}@localhost   (also <its address>:22 on your network when bridged)
   Directory       : $INSTALL_DIR
   Version record  : $INSTALL_DIR/versions.lock
 

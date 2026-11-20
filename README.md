@@ -38,7 +38,7 @@ When it finishes, it offers to start Debian right away. Enter the disk passphras
 | `debianclose` | Mac | Shuts Debian down cleanly from another terminal: presses the VM's power button, falls back to a hard stop after 90 s. `debianclose --force` stops it immediately |
 | `debianuninstall` | Mac | Removes what the setup installed. Asks about each item separately, so you can keep QEMU or the VM disk and remove the rest |
 | `debianseal verify` / `debianseal accept` | Mac | Checks the seal by hand / shows what changed and seals the current state after you confirm |
-| `ssh -p 2224 user@localhost` | Mac | SSH into the running VM (bound to `127.0.0.1` only) |
+| `ssh -p 2224 user@localhost` | Mac | SSH into the running VM (bound to `127.0.0.1` only). On your network the VM also has its own address, see [Network](#-network) |
 
 Inside the VM, `sudo poweroff` works too, and so does <kbd>Ctrl</kbd>+<kbd>A</kbd> then <kbd>X</kbd> (instant hard stop). <kbd>Ctrl</kbd>+<kbd>C</kbd> goes to the program running inside Debian, as in any terminal; it does not stop the VM.
 
@@ -83,7 +83,7 @@ Mac                                         VM
 Debian 12 (bookworm), arm64, from the official Debian archive (`deb.debian.org`: `bookworm`, `bookworm-updates`, `bookworm-security`). The base comes from the pinned netinst ISO through `debootstrap --variant=minbase`; `apt full-upgrade` during the install brings it up to date, so you boot into current packages. On top of the base: the `linux-image-arm64` kernel, systemd-boot, cryptsetup, btrfs-progs, OpenSSH, sudo, zsh, git, curl, wget and a few everyday tools (`less`, `nano`, `man`, `ping`, …).
 
 - **Boot:** systemd-boot on the ESP (`/boot/efi`). Kernels reach it through `kernel-install`, which Debian's kernel and initramfs hooks run on every update: `apt upgrade` installs a new kernel and it boots next time, no manual step
-- **Network:** systemd-networkd (DHCP) and systemd-resolved; systemd-timesyncd for the clock
+- **Network:** systemd-networkd (DHCP on the bridged card, see [Network](#-network)) and systemd-resolved; systemd-timesyncd for the clock
 - **Locale:** `C.UTF-8`; timezone UTC (`sudo timedatectl set-timezone Europe/Istanbul` to change it)
 
 ### Accounts and sudo
@@ -110,6 +110,20 @@ htop and lsd come from Debian. Two things Debian 12 does not ship come from thei
 - **ly 1.4.1** (the version Arch Linux ARM ships): built from upstream's source in the VM with upstream's vendored dependencies and Zig 0.16.0 from ziglang.org, without X11 support (there is no X server). The build tools are removed again afterwards
 
 > 💡 Powerlevel10k icons need a Nerd Font **in your Mac terminal**, e.g. *MesloLGS NF* (Ghostty ships a Nerd Font by default).
+
+---
+
+## 🌐 Network
+
+The VM is **bridged** to your Mac's network: it gets its own address from your router (DHCP), like any other machine at home, so other devices can reach the services you run in it. Find the address inside the VM with `ip -4 addr show` (fastfetch shows it as *Local IP* too).
+
+How: macOS only lets root bridge a network card, and Homebrew's QEMU does not have Apple's entitlement for it. The setup installs [socket_vmnet](https://github.com/lima-vm/socket_vmnet) (from the Lima project) as a small root service, the way Lima recommends: binaries copied to `/opt/socket_vmnet` (owned by root, so the service never runs a file your user could replace) and a launchd job, `/Library/LaunchDaemons/io.github.lima-vm.socket_vmnet.bridged.en0.plist`. That is the one step that asks for your **Mac password**, once. QEMU itself keeps running as you. The same service serves Arch Setup for Mac and BSD Setup for Mac: whichever installs first sets it up, the others reuse it.
+
+The VM has a second network card on QEMU's NAT that only carries `ssh -p 2224 …@localhost` from the Mac (fixed address `10.0.2.15`, no default route). If the bridge service is not running, `debianopen` says so and boots with the NAT alone, as before.
+
+- **Your network sees the VM.** SSH (and anything else you start) is reachable from your LAN, not only from the Mac. Use strong passwords, or SSH keys and `PasswordAuthentication no`
+- **Wi-Fi:** bridging works on Wi-Fi (`en0`), but some networks (company or hotel Wi-Fi, routers that limit devices per client) refuse the VM's extra address. Then the VM gets no address on that card; SSH on `127.0.0.1` still works. `DEBIANOPEN_BRIDGE=0` installs without the bridge
+- The router sees the VM as its own device with a fixed MAC address (chosen at install), so it keeps getting the same address and you can reserve it there
 
 ---
 
@@ -154,6 +168,7 @@ It asks about each item (`y/N`), shows a summary, and asks once more before remo
 | Download cache and logs | Alpine ISO, Debian ISO, `install.log`, `versions.lock` |
 | Shell commands | The `debianopen` block in `~/.zshrc` (all four commands) and `~/.zshrc.debianopen-backup` |
 | SSH host key | `[localhost]:2224` in `~/.ssh/known_hosts`, if present |
+| Bridged-network service | `/opt/socket_vmnet` and its launchd job (asks for your Mac password); the other setups' VMs use it too and fall back to NAT without it. Also `brew uninstall socket_vmnet` |
 | QEMU, GnuPG | `brew uninstall`; tells you if they were already there before the setup |
 | `brew autoremove` | Only offered if you removed one of the above |
 | Homebrew | Only offered if the setup installed it |
@@ -180,6 +195,8 @@ All optional, set as environment variables in front of the install command:
 | `DEBIANOPEN_ROOT_SIZE` / `DEBIANOPEN_ESP_SIZE` | `20G` / `1G` | Disk sizes (thin-provisioned qcow2) |
 | `DEBIANOPEN_USER` | `user` | Your account inside the VM (sudo group) |
 | `DEBIANOPEN_SSH_PORT` | `2224` | Host port forwarded to the VM's port 22 |
+| `DEBIANOPEN_BRIDGE=0` | | No bridged network: NAT only, no socket_vmnet, no Mac password asked |
+| `DEBIANOPEN_BRIDGE_IF` | interface of the default route (`en0`) | Mac network interface the VM is bridged to |
 | `DEBIANOPEN_LUKS_PASSPHRASE` | | Disk passphrase, instead of asking for it (needed for an install without a terminal) |
 | `DEBIANOPEN_YES=1` | | Do not ask for confirmation |
 | `DEBIANOPEN_FORCE=1` | | Overwrite an existing install |
@@ -247,6 +264,8 @@ Files on your Mac after install (`~/vm/debian`): `disk.qcow2`, `efi.qcow2`, `var
 
 | Problem | Fix |
 |---|---|
+| `Network: socket_vmnet is not running` at boot | `sudo launchctl kickstart -k system/io.github.lima-vm.socket_vmnet.bridged.en0`, then start the VM again. Log: `/var/log/socket_vmnet.bridged.en0.log` |
+| The VM has no address from the router | Inside the VM `ip -4 addr show`. The Wi-Fi may refuse extra devices (see [Network](#-network)); SSH on `127.0.0.1:2224` still works |
 | Install failed | Read `~/vm/debian/install.log` with `less` or `cat -v` (plain `cat` lets your terminal answer the escape sequences recorded in it, which leaves junk at your prompt), then run the setup again. It resumes downloads and redoes the disk |
 | `There is already an install` | `debianuninstall` first, or `DEBIANOPEN_FORCE=1` |
 | `INTEGRITY CHECK FAILED` | Something changed a VM file while Debian was off. If you know why (the last session crashed, you restored a backup), `debianseal accept`. If you don't, don't boot it |
